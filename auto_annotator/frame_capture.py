@@ -65,6 +65,11 @@ def capture_region(
     """
     left, top, width, height = bbox
 
+    # Validate window dimensions and coordinates (minimized or off-screen check).
+    # On Windows, minimized windows often report coordinates like -32000.
+    if left < -10000 or top < -10000 or width <= 0 or height <= 0:
+        raise ValueError(f"Invalid window bounding box (minimized or off-screen): {bbox}")
+
     monitor = {
         "left": left,
         "top": top,

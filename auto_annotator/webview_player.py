@@ -176,21 +176,21 @@ class ChildProcessJsBridge:
     def __init__(self, shared_state: dict) -> None:
         self.shared_state = shared_state
 
-    def log_from_js(self, message: str) -> None:
+    def log_from_js(self, message: str, *args, **kwargs) -> None:
         """Relay JS console logs to Python's logger."""
         logger.info("[JS Console] %s", message)
 
-    def on_player_ready(self) -> None:
+    def on_player_ready(self, *args, **kwargs) -> None:
         logger.info("Python (Child): Received player ready event from JS")
         self.shared_state["is_ready"] = True
 
-    def on_state_change(self, state: int) -> None:
-        logger.info("Python (Child): Received state change event from JS: %d", state)
-        self.shared_state["state"] = state
+    def on_state_change(self, state: int, *args, **kwargs) -> None:
+        logger.info("Python (Child): Received state change event from JS: %s", state)
+        self.shared_state["state"] = int(state) if state is not None else -1
 
-    def on_player_error(self, error_code: int) -> None:
-        logger.error("Python (Child): Received error event from JS: %d", error_code)
-        self.shared_state["error_code"] = error_code
+    def on_player_error(self, error_code: int, *args, **kwargs) -> None:
+        logger.error("Python (Child): Received error event from JS: %s", error_code)
+        self.shared_state["error_code"] = int(error_code) if error_code is not None else -1
 
 
 # ── Subprocess event loop target ───────────────────────────────────────

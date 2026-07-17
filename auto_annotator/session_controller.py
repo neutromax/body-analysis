@@ -43,7 +43,6 @@ from feature_classifier import (
 from calibration import Calibrator
 from aggregator import aggregate_window
 from excel_writer import ExcelWriter
-from webview_player import WebViewPlayer
 from stream_reader import StreamReader
 
 logger = logging.getLogger(__name__)
@@ -96,7 +95,6 @@ class SessionController:
 
     def __init__(
         self,
-        player: WebViewPlayer,
         excel_path: str,
         video_url: str,
         root_after: Callable,
@@ -104,13 +102,11 @@ class SessionController:
     ) -> None:
         """
         Args:
-            player:       The WebView player (already loaded).
             excel_path:   Path to the .xlsx file to append to.
             video_url:    The YouTube URL being annotated.
             root_after:   Tkinter's root.after(ms, callback) for scheduling.
             gui_callback: Called with a status dict every second for GUI updates.
         """
-        self._player = player
         self._root_after = root_after
         self._gui_callback = gui_callback
         self._video_url = video_url
@@ -122,10 +118,8 @@ class SessionController:
         self._calibrator = Calibrator()
 
         # In-memory stream reader (PyAV + yt-dlp)
-        self._stream_reader = StreamReader(
-            youtube_url=video_url,
-            get_player_time_fn=lambda: self._player.get_current_time(),
-        )
+        self._stream_reader = StreamReader(youtube_url=video_url)
+        self._session_start_time: float = 0.0
 
         # State
         self.state = SessionState.IDLE
@@ -150,6 +144,7 @@ class SessionController:
         self._window_readings = []
         self._window_index = 0
         self._calibrator = Calibrator()
+        self._session_start_time = time.time()
 
         # Start in-memory stream decoding
         self._stream_reader.start()
@@ -206,20 +201,14 @@ class SessionController:
         if self.state not in (SessionState.CALIBRATING, SessionState.RUNNING):
             return
 
-        # Check if video ended.
-        if self._player.is_ended():
-            logger.info("Video ended.")
+        # Check if stream has ended (no new frames for a while).
+        stream_pts = self._stream_reader.current_pts
+        if stream_pts > 0 and self._stream_reader.current_frame is None:
+            logger.info("Video stream ended.")
             self._flush_partial_window()
             self.state = SessionState.FINISHED
             self._notify_gui(finished=True)
             self._engine.close()
-            return
-
-        # Check if video is actually playing.
-        if not self._player.is_playing():
-            # Video might be buffering or paused by user in the player.
-            # Reschedule and try again.
-            self._schedule_next_tick()
             return
 
         # ── Capture & detect ───────────────────────────────────────────
@@ -344,8 +333,8 @@ class SessionController:
             "time_window": _format_time_window(self._window_index, 10),
             "readings_in_window": len(self._window_readings),
             "total_rows": self._total_rows,
-            "current_time": self._player.get_current_time(),
-            "video_duration": self._player.get_duration(),
+            "current_time": self._stream_reader.current_pts,
+            "video_duration": time.time() - self._session_start_time,
             "latest_reading": latest,
             "thresholds": self._thresholds,
             "calibration_progress": self._calibrator.readings_collected,

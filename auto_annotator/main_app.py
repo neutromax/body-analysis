@@ -4,9 +4,9 @@ Auto Annotator — Main Application
 
 Tkinter GUI shell that wires everything together.
 
-This is the entry point: it creates the control panel window, launches
-the pywebview video player, and connects button clicks to the
-session controller.
+This is the entry point: it creates the control panel window, connects
+button clicks to the session controller, and drives the in-memory
+PyAV stream reader (no embedded browser needed).
 
 Layout:
     ┌───────────────────────────────────────────────────────┐
@@ -45,7 +45,6 @@ from auto_config import (
     CALIBRATION_DURATION,
     OBSERVATIONS_PER_WINDOW,
 )
-from webview_player import WebViewPlayer
 from session_controller import SessionController, SessionState
 
 logger = logging.getLogger(__name__)
@@ -66,7 +65,6 @@ class AutoAnnotatorApp:
 
         # State
         self._excel_path: Optional[str] = None
-        self._player: Optional[WebViewPlayer] = None
         self._controller: Optional[SessionController] = None
         self._youtube_url: str = ""
 
@@ -324,7 +322,7 @@ class AutoAnnotatorApp:
             logger.info("Excel file selected: %s", path)
 
     def _load_video(self) -> None:
-        """Load the YouTube URL into the pywebview player."""
+        """Validate the YouTube URL and enable the Start button."""
         url = self._url_var.get().strip()
         if not url:
             messagebox.showwarning("No URL", "Please paste a YouTube URL.")
@@ -334,63 +332,30 @@ class AutoAnnotatorApp:
             messagebox.showwarning("No Excel File", "Please select an Excel file first.")
             return
 
-        self._youtube_url = url
-        self._load_btn.configure(state=tk.DISABLED)
-        self._session_status_var.set("Loading video...")
-
-        try:
-            # Create and show the player window.
-            self._player = WebViewPlayer()
-            self._player.load(url)
-
-            # Register video-ended callback.
-            self._player.bridge.set_on_ended(self._on_video_ended)
-
-            # Wait for player ready (non-blocking check via after).
-            self._session_status_var.set("Waiting for player...")
-            self.root.after(500, self._check_player_ready)
-
-        except ValueError as e:
-            messagebox.showerror("Invalid URL", str(e))
-            self._load_btn.configure(state=tk.NORMAL)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to load video:\n{e}")
-            self._load_btn.configure(state=tk.NORMAL)
-
-    def _check_player_ready(self) -> None:
-        """Poll until the YouTube player is ready or fails."""
-        if not self._player:
+        # Basic URL validation.
+        if "youtube.com" not in url and "youtu.be" not in url:
+            messagebox.showwarning("Invalid URL", "Please enter a valid YouTube URL.")
             return
 
-        status = self._player.get_status()
-
-        if status == "ready":
-            self._session_status_var.set("Ready — press Start")
-            self._start_btn.configure(state=tk.NORMAL)
-            logger.info("Player ready.")
-        elif status == "loading":
-            self._session_status_var.set("Loading player...")
-            # Not ready yet, check again in 500ms.
-            self.root.after(500, self._check_player_ready)
-        else:
-            # Error or timeout occurred
-            self._session_status_var.set(f"Player error: {status}")
-            self._load_btn.configure(state=tk.NORMAL)
-            logger.error("Player load failed: %s", status)
+        self._youtube_url = url
+        self._load_btn.configure(state=tk.DISABLED)
+        self._session_status_var.set("Ready — press Start")
+        self._start_btn.configure(state=tk.NORMAL)
+        logger.info("URL validated: %s", url)
 
     def _start(self) -> None:
         """Start the annotation session."""
-        if not self._player or not self._excel_path:
+        if not self._excel_path or not self._youtube_url:
             return
 
         # Create a new controller for this session.
         self._controller = SessionController(
-            player=self._player,
             excel_path=self._excel_path,
             video_url=self._youtube_url,
             root_after=self.root.after,
             gui_callback=self._update_gui,
         )
+        self._session_status_var.set("Resolving stream URL...")
         self._controller.start()
 
         # Update button states.
@@ -509,16 +474,13 @@ class AutoAnnotatorApp:
     # ── Cleanup ────────────────────────────────────────────────────────
 
     def _on_close(self) -> None:
-        """Handle window close — stop session, close player, exit."""
+        """Handle window close — stop session, exit."""
         if self._controller and self._controller.state in (
             SessionState.CALIBRATING,
             SessionState.RUNNING,
             SessionState.PAUSED,
         ):
             self._controller.stop()
-
-        if self._player:
-            self._player.close()
 
         self.root.destroy()
 

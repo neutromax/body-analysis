@@ -19,3 +19,8 @@ openpyxl>=3.1.0
 
 # Screen-region capture
 mss>=9.0.0
+
+# Direct stream decoding
+av>=12.0.0
+yt-dlp>=2023.0.0
+

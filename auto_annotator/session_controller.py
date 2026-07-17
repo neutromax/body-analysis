@@ -32,7 +32,6 @@ from auto_config import (
     CALIBRATION_DURATION,
     ENCODING,
 )
-from frame_capture import capture_region
 from pose_engine import PoseEngine
 from feature_classifier import (
     FrameMetrics,
@@ -45,6 +44,7 @@ from calibration import Calibrator
 from aggregator import aggregate_window
 from excel_writer import ExcelWriter
 from webview_player import WebViewPlayer
+from stream_reader import StreamReader
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +121,12 @@ class SessionController:
         self._writer.start_video(video_url)
         self._calibrator = Calibrator()
 
+        # In-memory stream reader (PyAV + yt-dlp)
+        self._stream_reader = StreamReader(
+            youtube_url=video_url,
+            get_player_time_fn=lambda: self._player.get_current_time(),
+        )
+
         # State
         self.state = SessionState.IDLE
         self._thresholds: Optional[Thresholds] = None
@@ -145,6 +151,10 @@ class SessionController:
         self._window_index = 0
         self._calibrator = Calibrator()
 
+        # Start in-memory stream decoding
+        self._stream_reader.start()
+        logger.info("In-memory stream reader started.")
+
         self._schedule_next_tick()
 
     def pause(self) -> None:
@@ -167,6 +177,7 @@ class SessionController:
         self._flush_partial_window()
         self.state = SessionState.STOPPED
         self._engine.close()
+        self._stream_reader.stop()
         logger.info("Session stopped. Total rows: %d", self._total_rows)
 
     # ── Timing loop ────────────────────────────────────────────────────
@@ -240,14 +251,11 @@ class SessionController:
         metrics = FrameMetrics()
 
         try:
-            # Get player bounding box for screen capture.
-            bbox = self._player.get_player_bbox()
-            if bbox is None:
-                logger.warning("Cannot get player bbox — skipping frame.")
+            # Get the current in-memory decoded frame from the stream reader.
+            image = self._stream_reader.current_frame
+            if image is None:
+                logger.warning("No decoded frame available yet — skipping.")
                 return reading, metrics
-
-            # Capture the player region.
-            image = capture_region(bbox)
 
             # Run pose detection.
             landmarks = self._engine.detect(image)

@@ -1,95 +1,79 @@
-# Body Language Annotation System (v2)
+# Automated Body Language Annotator (v3)
 
-A PyQt6 desktop application for manually annotating body language features (Hand, Leg, Head, Body movements) directly from YouTube videos using an embedded player. Designed for research workflows where videos are segmented into 10-second windows with 1-second observations.
+A research-grade Python desktop application that automatically generates a Body Language dataset from YouTube videos using MediaPipe Pose and geometry-based mathematics. No manual annotation, no machine learning model training, and no emotion recognition required.
 
-## Features
+## Key Features
 
-- **Embedded YouTube Player**: Annotate directly while watching the online video inside the application via the YouTube IFrame Player API. No downloading required!
-- **10-Second Windows**: Videos are automatically segmented into fixed annotation windows.
-- **Per-Second Observations**: 10 observations per window (one observation every 1 second).
-- **4 Body Features**: Hand Movement, Leg Movement, Head Bend, Body Lean.
-- **Keyboard Shortcuts**: Rapid annotation with single keystrokes (Q/W/E, A/S/D, Z/X/C, 1/2/3).
-- **Auto-Save**: Every observation is saved automatically to JSON. If the application closes unexpectedly, it resumes exactly where you stopped.
-- **Majority Vote**: Computes the final window label using majority-vote logic. Ties default to Neutral (0).
-- **Export**: Generates clean CSV and Excel files (Excel contains both aggregated data and raw audit logs).
+- **Embedded YouTube Player**: Powered by `pywebview` (WebView2 on Windows) running in a child process to bypass UI thread conflicts.
+- **MediaPipe Pose Integration**: Uses the modern Google MediaPipe Tasks API (`PoseLandmarker`) to detect pose landmarks at 1 Frame Per Second (FPS).
+- **Geometry-Based Math Classifiers**: Classifies Hand Movement, Leg Movement, Head Direction, and Body Lean as `-1` (Left) / `0` (Center) / `1` (Right).
+- **Statistical Calibration**: Calibrates motion thresholds dynamically from the first 3 seconds of the video using natural variance ($\mu \pm k\sigma$).
+- **Aggregated Outputs**: Performs majority-vote aggregation over 10-second windows and appends rows directly to an existing Excel sheet.
+- **Muted Autoplay Bypass**: Loads the video muted with `playsinline` to satisfy modern browser unmuted media block policies.
+- **Robust Exception Handling**: Detects restricted/non-embeddable videos (e.g. YouTube error codes 101, 150, 153) and re-enables inputs cleanly without hanging.
 
 ## Quick Start
 
 ### 1. Install Dependencies
 
-Ensure you have Python 3.8+ installed. Then run:
+Ensure you have Python 3.10 installed on your system. Then, run:
 
-```bash
+```powershell
 cd e:\projects\internship_iit
-pip install -r requirements.txt
+& "C:\Users\LENOVO\AppData\Local\Programs\Python\Python310\python.exe" -m pip install -r auto_annotator\requirements.txt
 ```
-
-*Note: Since the video is streamed online, you do not need `ffmpeg` or `yt-dlp`.*
 
 ### 2. Launch the Application
 
-```bash
-python main.py
+Double-click the startup script:
+- `run_auto_annotator.bat`
+
+Or run directly from your terminal:
+```powershell
+& "C:\Users\LENOVO\AppData\Local\Programs\Python\Python310\python.exe" auto_annotator\main_app.py
 ```
 
-### 3. Annotating Workflow
+*Note: On first startup, the app will download the MediaPipe pose landmarker model file (~13 MB) automatically.*
 
-1. Paste a YouTube URL on the Home Screen (e.g., `https://www.youtube.com/watch?v=dQw4w9WgXcQ`).
-2. Select the video category and click **Load Video**.
-3. Use the keyboard shortcuts to annotate the body features for the current observation:
-   - **Hand**: `Q` (Left) | `W` (Neutral) | `E` (Right)
-   - **Leg**: `A` (Left) | `S` (Neutral) | `D` (Right)
-   - **Head**: `Z` (Left) | `X` (Neutral/Center) | `C` (Right)
-   - **Body**: `1` (Left) | `2` (Neutral/Center) | `3` (Right)
-4. Press **Space** to confirm the current observation. If any feature is left unannotated, it defaults to Neutral (0). The player will automatically seek to the next second and pause.
-5. After 10 observations, the window advances, and the 10x4 mini-grid refreshes.
-6. Use the **Arrow Keys** to step backward or forward through observations.
-7. Use **Shift + Left/Right Arrow Keys** to jump to the previous or next window.
+---
 
-### 4. Exporting
+## Testing & Verification
 
-Access **File** in the menu bar to export your annotations:
-- **Export to CSV**: Generates a CSV containing only the time window and aggregated results.
-- **Export to Excel**: Generates a spreadsheet with two tabs: one for the final aggregated dataset and one for raw per-second observations.
+### 1. Automated Math & Logic Unit Tests
+To verify all coordinate geometry formulas, thresholding calibration, classifier mappings, and majority-vote tie-breaking:
+```powershell
+& "C:\Users\LENOVO\AppData\Local\Programs\Python\Python310\python.exe" -m pytest tests/test_auto_annotator.py -v
+```
+
+### 2. End-to-End Pipeline Integration Test
+To run a complete programmatic simulation of the video player, frame capture, MediaPipe inference, calibration, and Excel writing:
+```powershell
+& "C:\Users\LENOVO\AppData\Local\Programs\Python\Python310\python.exe" verify_integration.py
+```
+
+---
 
 ## Project Structure
 
 ```
 internship_iit/
-├── main.py                  # Entry point
-├── config.py                # All constants, paths, shortcuts, and colors
-├── requirements.txt         # Dependencies (PyQt6, pandas, openpyxl)
-├── core/
-│   ├── models.py            # Observation, Window, and Session dataclasses
-│   ├── segmenter.py         # Window/observation timestamp mathematics
-│   └── session_manager.py   # State tracking & workflow logic
-├── gui/
-│   ├── main_window.py       # Stacked view container & menu bar
-│   ├── home_panel.py        # Home screen for URL entry and session resume
-│   ├── player_widget.py     # Chromium QWebEngineView wrapper
-│   ├── player_bridge.py     # Python-JS QWebChannel bridge
-│   ├── annotation_panel.py  # Controls & buttons for annotations
-│   ├── progress_panel.py    # Detailed progress & position displays
-│   ├── observation_grid.py  # 10x4 mini status grid
-│   └── styles.py            # Centralized dark-mode stylesheet (QSS)
-├── storage/
-│   └── json_store.py        # File persistence, backups, & session listings
-├── aggregation/
-│   └── majority_vote.py     # Majority voting logic & tie-breaking
-├── export/
-│   └── exporter.py          # CSV & Excel exporting
-├── utils/
-│   └── helpers.py           # YouTube URL parsing and time formatting
-├── resources/
-│   └── player.html          # Embedded HTML page running the IFrame API
-├── data/                    # JSON sessions and exports (git-ignored)
-└── tests/                   # Python unit tests (pytest)
-```
-
-## Running Tests
-
-Verify the core logic, segmenter, and aggregation functions by running:
-
-```bash
-python -m pytest tests/ -v
+├── auto_annotator/          # Core automated annotator system
+│   ├── main_app.py          # Tkinter dark-themed control panel
+│   ├── auto_config.py       # Configuration parameters and constants
+│   ├── geometry.py          # Pure vector geometry calculations
+│   ├── pose_engine.py       # MediaPipe Pose Landmarker Tasks API wrapper
+│   ├── feature_classifier.py# Mappings from numbers to -1 / 0 / 1 labels
+│   ├── calibration.py       # Natural variance baseline calibration
+│   ├── aggregator.py        # Majority vote window aggregation
+│   ├── excel_writer.py      # openpyxl Excel spreadsheet appender
+│   ├── frame_capture.py     # mss desktop screen-region screenshot utility
+│   ├── webview_player.py    # Subprocess-isolated pywebview YouTube player
+│   └── requirements.txt     # Python requirements
+├── tests/
+│   ├── __init__.py
+│   └── test_auto_annotator.py # 17/17 passing unit tests
+├── verify_integration.py    # Headless E2E verification script
+├── run_auto_annotator.bat   # App startup shortcut script
+├── .gitignore               # Ignored local logs and outputs
+└── README.md                # This documentation
 ```

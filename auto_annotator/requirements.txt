@@ -1,0 +1,21 @@
+# Auto Annotator — Dependencies
+# Python 3.10+ required
+
+# Embedded browser for YouTube playback (uses WebView2 on Windows)
+pywebview>=5.0
+
+# Pose estimation
+mediapipe>=0.10.0
+
+# Image handling
+opencv-python>=4.8.0
+
+# Vector math
+numpy>=1.24.0
+
+# Excel read/write
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# Screen-region capture
+mss>=9.0.0

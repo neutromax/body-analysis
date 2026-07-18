@@ -35,6 +35,8 @@ from geometry import (
     torso_local_position,
     midpoint,
     limb_lateral_velocity,
+    euclidean_dist,
+    unit_vector,
 )
 # Type alias: each landmark is (x, y, visibility).
 # Defined here (not imported from pose_engine) to avoid dragging mediapipe
@@ -145,6 +147,43 @@ def classify_limb_movement(
     return 0
 
 
+def classify_limb_position(
+    local_x_left: Optional[float],
+    local_x_right: Optional[float],
+    threshold: float = 0.15,
+) -> Optional[int]:
+    """
+    Classify hand or leg **position** as a fallback when velocity is
+    unavailable (first frame, or after a detection gap).
+
+    Uses the lateral position of the dominant (most-displaced) side's
+    wrist or ankle relative to the body center.
+
+    Args:
+        local_x_left:   Body-relative lateral position of left wrist/ankle.
+        local_x_right:  Body-relative lateral position of right wrist/ankle.
+        threshold:      Displacement beyond which position is significant
+                        (in shoulder widths, default 0.15).
+    Returns:
+        1 if dominant side is to body's right, -1 if left, 0 if centered,
+        None if both positions are unavailable.
+    """
+    if local_x_left is None and local_x_right is None:
+        return None
+    if local_x_left is None:
+        dominant = local_x_right
+    elif local_x_right is None:
+        dominant = local_x_left
+    else:
+        dominant = local_x_left if abs(local_x_left) >= abs(local_x_right) else local_x_right
+
+    if dominant > threshold:
+        return 1
+    if dominant < -threshold:
+        return -1
+    return 0
+
+
 # ───────────────────────────────────────────────────────────────────────
 # Frame-level orchestration
 # ───────────────────────────────────────────────────────────────────────
@@ -239,15 +278,56 @@ def compute_frame_metrics(
     body_visible = _check_visibility(
         landmarks, REQUIRED_LANDMARKS["body"], vis_threshold
     )
+
     if not body_visible:
-        return metrics  # Can't compute anything without the torso.
+        # Check if shoulders are visible for fallback
+        shoulders_visible = _check_visibility(
+            landmarks, ["LEFT_SHOULDER", "RIGHT_SHOULDER"], vis_threshold
+        )
+        if not shoulders_visible:
+            return metrics  # Can't compute anything without at least shoulders.
 
-    ls = _get_xy(landmarks, "LEFT_SHOULDER")
-    rs = _get_xy(landmarks, "RIGHT_SHOULDER")
-    lh = _get_xy(landmarks, "LEFT_HIP")
-    rh = _get_xy(landmarks, "RIGHT_HIP")
+        ls = _get_xy(landmarks, "LEFT_SHOULDER")
+        rs = _get_xy(landmarks, "RIGHT_SHOULDER")
+        S = euclidean_dist(ls, rs)
+        if S < 1e-9:
+            return metrics
 
-    C_s, C_h, S, u, r = body_reference_frame(ls, rs, lh, rh)
+        # r points from right shoulder to left shoulder (screen-right)
+        v_sh = (ls[0] - rs[0], ls[1] - rs[1])
+        r = unit_vector(v_sh)
+
+        # u is perpendicular to r, pointing screen-up (negative y)
+        u = (r[1], -r[0])
+
+        # Estimate virtual hips: C_h = C_s - 1.5 * S * u
+        # Since u points up, subtracting it goes DOWN (increasing y)
+        virtual_offset = (1.5 * S * u[0], 1.5 * S * u[1])
+        lh = (ls[0] - virtual_offset[0], ls[1] - virtual_offset[1])
+        rh = (rs[0] - virtual_offset[0], rs[1] - virtual_offset[1])
+
+        # Compute reference frame using the virtual hips
+        C_s, C_h, S, u, r = body_reference_frame(ls, rs, lh, rh)
+
+        # Exclude hips from required landmarks for fallback checks
+        req_head = (
+            ["NOSE", "LEFT_SHOULDER", "RIGHT_SHOULDER"]
+            if HEAD_LANDMARK_MODE != "EAR_MIDPOINT"
+            else ["LEFT_EAR", "RIGHT_EAR", "LEFT_SHOULDER", "RIGHT_SHOULDER"]
+        )
+        req_hand = ["LEFT_WRIST", "RIGHT_WRIST", "LEFT_SHOULDER", "RIGHT_SHOULDER"]
+        req_leg = []  # Legs always require actual hips, so legs will remain None
+    else:
+        ls = _get_xy(landmarks, "LEFT_SHOULDER")
+        rs = _get_xy(landmarks, "RIGHT_SHOULDER")
+        lh = _get_xy(landmarks, "LEFT_HIP")
+        rh = _get_xy(landmarks, "RIGHT_HIP")
+
+        C_s, C_h, S, u, r = body_reference_frame(ls, rs, lh, rh)
+
+        req_head = REQUIRED_LANDMARKS["head"]
+        req_hand = REQUIRED_LANDMARKS["hand"]
+        req_leg = REQUIRED_LANDMARKS["leg"]
 
     if S < 1e-9:
         return metrics  # Degenerate: shoulders overlap.
@@ -257,7 +337,7 @@ def compute_frame_metrics(
 
     # ── Head direction ─────────────────────────────────────────────────
     head_visible = _check_visibility(
-        landmarks, REQUIRED_LANDMARKS["head"], vis_threshold
+        landmarks, req_head, vis_threshold
     )
     if head_visible:
         if HEAD_LANDMARK_MODE == "EAR_MIDPOINT":
@@ -271,7 +351,7 @@ def compute_frame_metrics(
 
     # ── Wrist positions (for hand velocity) ────────────────────────────
     hand_visible = _check_visibility(
-        landmarks, REQUIRED_LANDMARKS["hand"], vis_threshold
+        landmarks, req_hand, vis_threshold
     )
     if hand_visible:
         lw = _get_xy(landmarks, "LEFT_WRIST")
@@ -295,28 +375,29 @@ def compute_frame_metrics(
                 )
 
     # ── Ankle positions (for leg velocity) ─────────────────────────────
-    leg_visible = _check_visibility(
-        landmarks, REQUIRED_LANDMARKS["leg"], vis_threshold
-    )
-    if leg_visible:
-        la = _get_xy(landmarks, "LEFT_ANKLE")
-        ra = _get_xy(landmarks, "RIGHT_ANKLE")
+    if req_leg:
+        leg_visible = _check_visibility(
+            landmarks, req_leg, vis_threshold
+        )
+        if leg_visible:
+            la = _get_xy(landmarks, "LEFT_ANKLE")
+            ra = _get_xy(landmarks, "RIGHT_ANKLE")
 
-        la_local_x, _ = torso_local_position(la, C_s, u, r, S)
-        ra_local_x, _ = torso_local_position(ra, C_s, u, r, S)
+            la_local_x, _ = torso_local_position(la, C_s, u, r, S)
+            ra_local_x, _ = torso_local_position(ra, C_s, u, r, S)
 
-        metrics.ankle_left_local_x = la_local_x
-        metrics.ankle_right_local_x = ra_local_x
+            metrics.ankle_left_local_x = la_local_x
+            metrics.ankle_right_local_x = ra_local_x
 
-        if prev_metrics is not None:
-            if prev_metrics.ankle_left_local_x is not None:
-                metrics.leg_v_left = limb_lateral_velocity(
-                    la_local_x, prev_metrics.ankle_left_local_x
-                )
-            if prev_metrics.ankle_right_local_x is not None:
-                metrics.leg_v_right = limb_lateral_velocity(
-                    ra_local_x, prev_metrics.ankle_right_local_x
-                )
+            if prev_metrics is not None:
+                if prev_metrics.ankle_left_local_x is not None:
+                    metrics.leg_v_left = limb_lateral_velocity(
+                        la_local_x, prev_metrics.ankle_left_local_x
+                    )
+                if prev_metrics.ankle_right_local_x is not None:
+                    metrics.leg_v_right = limb_lateral_velocity(
+                        ra_local_x, prev_metrics.ankle_right_local_x
+                    )
 
     return metrics
 
@@ -356,14 +437,22 @@ def classify_frame(
     else:
         reading["head"] = None
 
-    # Hand movement
+    # Hand movement (velocity primary, position fallback)
     reading["hand"] = classify_limb_movement(
         metrics.hand_v_left, metrics.hand_v_right, thresholds.T_hand
     )
+    if reading["hand"] is None:
+        reading["hand"] = classify_limb_position(
+            metrics.wrist_left_local_x, metrics.wrist_right_local_x,
+        )
 
-    # Leg movement
+    # Leg movement (velocity primary, position fallback)
     reading["leg"] = classify_limb_movement(
         metrics.leg_v_left, metrics.leg_v_right, thresholds.T_leg
     )
+    if reading["leg"] is None:
+        reading["leg"] = classify_limb_position(
+            metrics.ankle_left_local_x, metrics.ankle_right_local_x,
+        )
 
     return reading

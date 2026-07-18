@@ -119,8 +119,8 @@ class PoseEngine:
     def __init__(
         self,
         model_complexity: int = 1,
-        min_detection_confidence: float = 0.5,
-        min_tracking_confidence: float = 0.5,
+        min_detection_confidence: float = 0.3,
+        min_tracking_confidence: float = 0.3,
     ) -> None:
         """
         Initialize the MediaPipe PoseLandmarker.
@@ -138,15 +138,16 @@ class PoseEngine:
 
         options = PoseLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=model_path),
-            running_mode=RunningMode.IMAGE,
+            running_mode=RunningMode.VIDEO,
             num_poses=1,
             min_pose_detection_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
         )
         self._landmarker = PoseLandmarker.create_from_options(options)
+        self._last_timestamp_ms: int = -1
 
         logger.info(
-            "PoseEngine initialized (complexity=%d, det=%.2f, track=%.2f)",
+            "PoseEngine initialized (complexity=%d, det=%.2f, track=%.2f, mode=VIDEO)",
             model_complexity,
             min_detection_confidence,
             min_tracking_confidence,
@@ -169,13 +170,15 @@ class PoseEngine:
 
     # ── Core detection ─────────────────────────────────────────────────
 
-    def detect(self, image: np.ndarray) -> Optional[LandmarkData]:
+    def detect(self, image: np.ndarray, timestamp_ms: int = 0) -> Optional[LandmarkData]:
         """
-        Run pose detection on a single image.
+        Run pose detection on a single image using VIDEO mode tracking.
 
         Args:
-            image:  A NumPy array in BGR format (as returned by OpenCV
-                    or mss screen capture).  Shape: (H, W, 3).
+            image:         A NumPy array in BGR format (as returned by
+                           OpenCV or mss screen capture).  Shape: (H, W, 3).
+            timestamp_ms:  Frame timestamp in milliseconds.  Must increase
+                           monotonically between calls (enforced internally).
 
         Returns:
             A dict mapping landmark name → (x, y, visibility) in
@@ -192,17 +195,29 @@ class PoseEngine:
                 f"Expected a 3-channel image, got shape={getattr(image, 'shape', None)}"
             )
 
+        # Ensure the array is contiguous (required by cv2 and MediaPipe).
+        if not image.flags['C_CONTIGUOUS']:
+            image = np.ascontiguousarray(image)
+
+        # Ensure monotonically increasing timestamp for VIDEO mode.
+        if timestamp_ms <= self._last_timestamp_ms:
+            timestamp_ms = self._last_timestamp_ms + 1
+        self._last_timestamp_ms = timestamp_ms
+
         # MediaPipe expects RGB; OpenCV/mss gives BGR.
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         # Wrap in a MediaPipe Image.
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-        # Run detection.
-        result = self._landmarker.detect(mp_image)
+        # Run detection with temporal tracking.
+        result = self._landmarker.detect_for_video(mp_image, timestamp_ms)
 
         if not result.pose_landmarks:
-            logger.debug("No pose detected in frame.")
+            logger.debug(
+                "No pose detected in frame (shape=%s, mean_px=%.0f).",
+                image.shape, image.mean(),
+            )
             return None
 
         # Use the first detected pose.

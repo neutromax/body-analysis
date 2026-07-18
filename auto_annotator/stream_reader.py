@@ -50,6 +50,9 @@ class StreamReader:
         self._is_resolved = threading.Event()
         self._resolve_error: Optional[str] = None
 
+        self._is_finished = threading.Event()
+        self._decode_start_time: float = 0.0
+
     @property
     def current_frame(self) -> Optional[np.ndarray]:
         """Get the latest decoded frame as a BGR NumPy array."""
@@ -61,6 +64,11 @@ class StreamReader:
         """Get the PTS (playback timestamp) in seconds of the current frame."""
         with self._frame_lock:
             return self._current_pts
+
+    @property
+    def is_finished(self) -> bool:
+        """Whether the stream has finished decoding all frames."""
+        return self._is_finished.is_set()
 
     def start(self) -> None:
         """Start the background decoding thread."""
@@ -76,10 +84,15 @@ class StreamReader:
             self._thread = None
         logger.info("Stream reader stopped.")
 
-    def _resolve_stream_url(self) -> Optional[str]:
-        """Resolve YouTube URL to direct video stream URL using yt-dlp."""
+    def _resolve_stream_url(self) -> Optional[tuple]:
+        """
+        Resolve YouTube URL to direct video stream URL using yt-dlp.
+
+        Returns:
+            (stream_url, http_headers_str) or None on failure.
+        """
         ydl_opts = {
-            "format": "bestvideo[ext=mp4]/best[ext=mp4]/best",
+            "format": "bestvideo[height<=720][ext=mp4]/best[height<=720][ext=mp4]/bestvideo[ext=mp4]/best[ext=mp4]/best",
             "quiet": True,
             "no_warnings": True,
         }
@@ -87,17 +100,34 @@ class StreamReader:
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(self.youtube_url, download=False)
-                return info["url"]
+                url = info["url"]
+
+                # Build HTTP headers string for FFmpeg/PyAV.
+                http_headers = info.get("http_headers", {})
+                headers_str = ""
+                for k, v in http_headers.items():
+                    headers_str += f"{k}: {v}\r\n"
+
+                logger.info(
+                    "Resolved stream URL (format=%s, resolution=%sx%s)",
+                    info.get("format_id", "?"),
+                    info.get("width", "?"),
+                    info.get("height", "?"),
+                )
+                return url, headers_str
         except Exception as e:
             self._resolve_error = str(e)
             logger.error("Failed to resolve stream URL: %s", e)
             return None
 
     def _run(self) -> None:
-        """Background thread logic for sequential decoding and time sync."""
-        stream_url = self._resolve_stream_url()
-        if not stream_url:
+        """Background thread: resolve URL, open PyAV container, decode frames."""
+        result = self._resolve_stream_url()
+        if not result:
+            self._is_finished.set()
             return
+
+        stream_url, headers_str = result
         self._is_resolved.set()
 
         container = None
@@ -111,11 +141,19 @@ class StreamReader:
                 except Exception:
                     pass
             try:
-                logger.info("Opening PyAV stream container (seek_time=%.2fs)...", seek_time)
-                # Open with standard timeouts to prevent hangs
-                container = av.open(stream_url, options={"timeout": "15000000"})
+                logger.info("Opening PyAV container (seek=%.2fs)...", seek_time)
+                options = {
+                    "timeout": "15000000",
+                    "reconnect": "1",
+                    "reconnect_streamed": "1",
+                    "reconnect_delay_max": "5",
+                }
+                if headers_str:
+                    options["headers"] = headers_str
+
+                container = av.open(stream_url, options=options)
                 video_stream = container.streams.video[0]
-                video_stream.thread_type = "AUTO"  # Enable multi-threaded decoding
+                video_stream.thread_type = "AUTO"
                 if seek_time > 0.0:
                     pts = int(seek_time / video_stream.time_base)
                     container.seek(pts, stream=video_stream)
@@ -125,71 +163,53 @@ class StreamReader:
                 return False
 
         if not _open_container(0.0):
+            self._is_finished.set()
             return
 
-        logger.info("In-memory PyAV stream decoding loop started.")
-        
+        logger.info("In-memory PyAV decoding loop started.")
+        last_cache_time = 0.0
+        self._decode_start_time = time.time()
+
         while not self._stop_event.is_set():
             try:
-                # 1. Sync decoding time with player time if possible
-                player_time = 0.0
-                if self.get_player_time:
-                    player_time = self.get_player_time()
-
-                # Get current decoded frame's timestamp
-                with self._frame_lock:
-                    curr_pts = self._current_pts
-
-                # Check if we are running too far ahead of the video player (e.g. > 3 seconds)
-                if self.get_player_time and curr_pts > player_time + 3.0:
-                    time.sleep(0.1)
-                    continue
-
-                # Check if the player has seeked backward or significantly forward (> 10 seconds ahead of us)
-                if self.get_player_time:
-                    # Seek backward detected
-                    if player_time < curr_pts - 1.5:
-                        logger.info("Seek backward detected (player: %.2fs, stream: %.2fs). Seeking stream...", player_time, curr_pts)
-                        _open_container(player_time)
-                        continue
-                    # Large seek forward detected
-                    elif player_time > curr_pts + 10.0:
-                        logger.info("Seek forward detected (player: %.2fs, stream: %.2fs). Seeking stream...", player_time, curr_pts)
-                        _open_container(player_time)
-                        continue
-
-                # 2. Decode the next frame from container
-                frame_decoded = False
                 for frame in container.decode(video=0):
                     if self._stop_event.is_set():
                         break
 
                     pts_sec = float(frame.pts * video_stream.time_base)
-                    
-                    # Convert to standard BGR image in-memory
-                    bgr_img = frame.to_ndarray(format="bgr24")
 
-                    # Cache the frame
+                    # Cache at most 1 frame per second (skip intermediate frames)
+                    if pts_sec - last_cache_time < 0.9:
+                        continue
+
+                    bgr_img = np.ascontiguousarray(frame.to_ndarray(format="bgr24"))
                     with self._frame_lock:
                         self._current_frame = bgr_img
                         self._current_pts = pts_sec
+                    last_cache_time = pts_sec
 
-                    frame_decoded = True
-                    
-                    # Break out to check player sync again
-                    break
+                    # Pace to real-time so session controller ticks stay in sync.
+                    elapsed_real = time.time() - self._decode_start_time
+                    video_ahead = pts_sec - elapsed_real
+                    if video_ahead > 0.5:
+                        target = self._decode_start_time + pts_sec
+                        while time.time() < target and not self._stop_event.is_set():
+                            time.sleep(min(target - time.time(), 0.1))
 
-                if not frame_decoded:
-                    # End of stream or buffer empty, sleep briefly
-                    time.sleep(0.1)
+                # If we exit the for loop normally, the stream ended
+                logger.info("Stream decoding reached end of video.")
+                break
 
             except Exception as e:
-                logger.warning("Error during PyAV stream decoding: %s. Reopening...", e)
-                time.sleep(1.0)
-                # Attempt container recovery/reopen at the last known time
+                logger.warning("PyAV decode error: %s. Retrying...", e)
+                time.sleep(2.0)
                 with self._frame_lock:
                     reopen_time = max(0.0, self._current_pts)
-                _open_container(reopen_time)
+                if not _open_container(reopen_time):
+                    break
+
+        # Signal that decoding is complete.
+        self._is_finished.set()
 
         # Cleanup
         if container is not None:
@@ -197,4 +217,5 @@ class StreamReader:
                 container.close()
             except Exception:
                 pass
-        logger.info("In-memory PyAV stream decoding loop stopped.")
+        logger.info("In-memory PyAV decoding loop stopped.")
+

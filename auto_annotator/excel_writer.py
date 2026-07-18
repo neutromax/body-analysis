@@ -88,12 +88,16 @@ class ExcelWriter:
         """Save the workbook to disk."""
         try:
             self._wb.save(str(self.filepath))
+            if getattr(self, "_save_failed_previously", False):
+                logger.info("Excel file successfully saved after previous lock was released.")
+                self._save_failed_previously = False
         except PermissionError:
-            logger.error(
-                "Cannot save Excel file — it may be open in another program: %s",
+            self._save_failed_previously = True
+            logger.warning(
+                "Excel file is locked (possibly open in another program like Excel). "
+                "The row was saved in-memory and will be written to disk on the next update once the file is closed: %s",
                 self.filepath,
             )
-            raise
         except OSError as e:
             logger.error("Failed to save Excel file: %s", e)
             raise

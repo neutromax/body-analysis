@@ -22,9 +22,14 @@ Threading model:
 from __future__ import annotations
 
 import logging
+import os
 import time
+import math
 from enum import Enum, auto
 from typing import Callable, Dict, List, Optional
+
+import cv2
+import numpy as np
 
 from auto_config import (
     OBSERVATION_INTERVAL,
@@ -129,6 +134,9 @@ class SessionController:
         self._prev_metrics: Optional[FrameMetrics] = None
         self._after_id: Optional[str] = None
         self._total_rows: int = 0
+        self._debug_frame_count: int = 0
+        self._last_processed_pts: Optional[float] = None
+        self._last_pose_pts: Optional[float] = None
 
     # ── Public control methods ─────────────────────────────────────────
 
@@ -149,6 +157,13 @@ class SessionController:
         # Start in-memory stream decoding
         self._stream_reader.start()
         logger.info("In-memory stream reader started.")
+
+        # Initialize OpenCV visualization window resizable
+        try:
+            cv2.namedWindow("Auto Annotator — Pose Tracking", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Auto Annotator — Pose Tracking", 854, 480)
+        except Exception as e:
+            logger.warning("Could not initialize OpenCV visualization window: %s", e)
 
         self._schedule_next_tick()
 
@@ -173,6 +188,10 @@ class SessionController:
         self.state = SessionState.STOPPED
         self._engine.close()
         self._stream_reader.stop()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         logger.info("Session stopped. Total rows: %d", self._total_rows)
 
     # ── Timing loop ────────────────────────────────────────────────────
@@ -201,18 +220,36 @@ class SessionController:
         if self.state not in (SessionState.CALIBRATING, SessionState.RUNNING):
             return
 
-        # Check if stream has ended (no new frames for a while).
-        stream_pts = self._stream_reader.current_pts
-        if stream_pts > 0 and self._stream_reader.current_frame is None:
-            logger.info("Video stream ended.")
+        # Check if the stream has finished decoding all frames.
+        if self._stream_reader.is_finished:
+            logger.info("Video stream finished decoding.")
             self._flush_partial_window()
             self.state = SessionState.FINISHED
             self._notify_gui(finished=True)
             self._engine.close()
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+            return
+
+        # Skip this tick if no frame is available yet (stream still
+        # resolving the URL or buffering the first frame).
+        if self._stream_reader.current_frame is None:
+            logger.info("No frame available yet — waiting for stream to start...")
+            self._notify_gui()
+            self._schedule_next_tick()
+            return
+
+        # Skip if this frame has already been processed (prevents duplicates during buffering/lags)
+        stream_pts = self._stream_reader.current_pts
+        if self._last_processed_pts is not None and abs(stream_pts - self._last_processed_pts) < 0.1:
+            self._after_id = self._root_after(100, self._tick)
             return
 
         # ── Capture & detect ───────────────────────────────────────────
         reading, metrics = self._capture_and_classify()
+        self._last_processed_pts = stream_pts
 
         # ── Route to calibration or main loop ──────────────────────────
         if self.state == SessionState.CALIBRATING:
@@ -246,25 +283,278 @@ class SessionController:
                 logger.warning("No decoded frame available yet — skipping.")
                 return reading, metrics
 
-            # Run pose detection.
-            landmarks = self._engine.detect(image)
+            # Save first few frames to disk for diagnostic inspection.
+            if self._debug_frame_count < 3:
+                self._save_debug_frame(image)
+
+            # Run pose detection (VIDEO mode with temporal tracking).
+            pts_ms = int(self._stream_reader.current_pts * 1000)
+            landmarks = self._engine.detect(image, timestamp_ms=pts_ms)
             if landmarks is None:
-                logger.debug("No pose detected — marking all features as NA.")
-                self._prev_metrics = None
+                logger.info(
+                    "No pose detected — shape=%s, dtype=%s, mean_px=%.1f, PTS=%.1fs",
+                    image.shape, image.dtype, float(image.mean()),
+                    self._stream_reader.current_pts,
+                )
+                # Keep prev_metrics so velocity can be computed when
+                # detection resumes (don't break the chain).
+                self._visualize_frame(image, None, reading)
                 return reading, metrics
 
-            # Compute raw metrics.
-            metrics = compute_frame_metrics(landmarks, self._prev_metrics)
+            # Compute raw metrics. Only compute velocity if consecutive frames are close in time (<= 1.5s).
+            current_pts = self._stream_reader.current_pts
+            if self._last_pose_pts is not None and (current_pts - self._last_pose_pts) <= 1.5:
+                metrics = compute_frame_metrics(landmarks, self._prev_metrics)
+            else:
+                metrics = compute_frame_metrics(landmarks, None)
+
             self._prev_metrics = metrics
+            self._last_pose_pts = current_pts
+
+            logger.info(
+                "Pose DETECTED — PTS=%.1fs, angle=%.1f°, head_x=%s",
+                current_pts,
+                metrics.body_angle_deg if metrics.body_angle_deg is not None else 0,
+                metrics.head_local_x,
+            )
 
             # Classify (only if we have thresholds — i.e. post-calibration).
             if self._thresholds is not None:
                 reading = classify_frame(metrics, self._thresholds)
 
+            self._visualize_frame(image, landmarks, reading)
+
         except Exception as e:
             logger.error("Error during capture/classify: %s", e, exc_info=True)
 
         return reading, metrics
+
+    def _visualize_frame(
+        self,
+        image: np.ndarray,
+        landmarks: Optional[dict],
+        reading: FrameReading,
+    ) -> None:
+        """Draw pose landmarks, skeleton, and HUD of classified states on the frame."""
+        try:
+            visual_image = image.copy()
+            H, W, _ = visual_image.shape
+
+            # Extract/estimate landmarks for drawing
+            draw_landmarks = landmarks.copy() if landmarks is not None else None
+            
+            if draw_landmarks is not None:
+                # Check for virtual hips: if shoulders are visible but hips are not
+                has_hips = (
+                    "LEFT_HIP" in draw_landmarks and draw_landmarks["LEFT_HIP"][2] >= 0.3 and
+                    "RIGHT_HIP" in draw_landmarks and draw_landmarks["RIGHT_HIP"][2] >= 0.3
+                )
+                has_shoulders = (
+                    "LEFT_SHOULDER" in draw_landmarks and draw_landmarks["LEFT_SHOULDER"][2] >= 0.3 and
+                    "RIGHT_SHOULDER" in draw_landmarks and draw_landmarks["RIGHT_SHOULDER"][2] >= 0.3
+                )
+                
+                if not has_hips and has_shoulders:
+                    ls = draw_landmarks["LEFT_SHOULDER"]
+                    rs = draw_landmarks["RIGHT_SHOULDER"]
+                    dx = ls[0] - rs[0]
+                    dy = ls[1] - rs[1]
+                    S = math.sqrt(dx * dx + dy * dy)
+                    if S > 1e-9:
+                        rx, ry = dx / S, dy / S
+                        ux, uy = ry, -rx
+                        virtual_offset_x = 1.5 * S * ux
+                        virtual_offset_y = 1.5 * S * uy
+                        draw_landmarks["LEFT_HIP"] = (
+                            ls[0] - virtual_offset_x,
+                            ls[1] - virtual_offset_y,
+                            -1.0,  # Negative visibility signals virtual landmark
+                        )
+                        draw_landmarks["RIGHT_HIP"] = (
+                            rs[0] - virtual_offset_x,
+                            rs[1] - virtual_offset_y,
+                            -1.0,
+                        )
+
+                # Connections definitions: (start, end)
+                connections = [
+                    ("LEFT_SHOULDER", "RIGHT_SHOULDER"),
+                    ("LEFT_SHOULDER", "LEFT_ELBOW"),
+                    ("LEFT_ELBOW", "LEFT_WRIST"),
+                    ("RIGHT_SHOULDER", "RIGHT_ELBOW"),
+                    ("RIGHT_ELBOW", "RIGHT_WRIST"),
+                    ("LEFT_SHOULDER", "LEFT_HIP"),
+                    ("RIGHT_SHOULDER", "RIGHT_HIP"),
+                    ("LEFT_HIP", "RIGHT_HIP"),
+                    ("LEFT_HIP", "LEFT_KNEE"),
+                    ("LEFT_KNEE", "LEFT_ANKLE"),
+                    ("RIGHT_HIP", "RIGHT_KNEE"),
+                    ("RIGHT_KNEE", "RIGHT_ANKLE"),
+                    ("NOSE", "LEFT_EAR"),
+                    ("NOSE", "RIGHT_EAR"),
+                ]
+
+                # Draw skeleton lines
+                for start_name, end_name in connections:
+                    if start_name in draw_landmarks and end_name in draw_landmarks:
+                        x1, y1, v1 = draw_landmarks[start_name]
+                        x2, y2, v2 = draw_landmarks[end_name]
+                        
+                        p1 = (int(x1 * W), int(y1 * H))
+                        p2 = (int(x2 * W), int(y2 * H))
+
+                        # Color: yellow if either is virtual, green if both visible, red otherwise
+                        if v1 == -1.0 or v2 == -1.0:
+                            color = (0, 255, 255)  # Yellow BGR
+                        elif v1 >= 0.3 and v2 >= 0.3:
+                            color = (106, 206, 158)  # Green BGR
+                        else:
+                            color = (142, 118, 247)  # Red BGR
+                            
+                        cv2.line(visual_image, p1, p2, color, 2)
+
+                # Draw joint circles
+                for name, lm_data in draw_landmarks.items():
+                    x, y, v = lm_data
+                    px, py = int(x * W), int(y * H)
+                    
+                    if v == -1.0:
+                        color = (0, 255, 255)  # Yellow
+                    elif v >= 0.3:
+                        color = (106, 206, 158)  # Green
+                    else:
+                        color = (142, 118, 247)  # Red
+                        
+                    cv2.circle(visual_image, (px, py), 5, color, -1)
+                    cv2.circle(visual_image, (px, py), 6, (0, 0, 0), 1)  # black border for contrast
+            else:
+                # Pose detection failed HUD message
+                cv2.putText(
+                    visual_image,
+                    "NO POSE DETECTED",
+                    (320, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (142, 118, 247),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+            # Draw HUD panel background (semi-transparent)
+            overlay = visual_image.copy()
+            cv2.rectangle(overlay, (10, 10), (290, 200), (30, 27, 26), -1)
+            cv2.addWeighted(overlay, 0.8, visual_image, 0.2, 0, visual_image)
+            cv2.rectangle(visual_image, (10, 10), (290, 200), (247, 162, 122), 1)
+
+            # Draw HUD Text
+            # Title
+            cv2.putText(
+                visual_image,
+                "AUTO ANNOTATOR",
+                (20, 32),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (247, 162, 122),
+                2,
+                cv2.LINE_AA,
+            )
+            # State
+            state_str = f"State: {self.state.name}"
+            cv2.putText(
+                visual_image,
+                state_str,
+                (20, 55),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            # Window
+            window_str = f"Window: {_format_time_window(self._window_index, 10)}"
+            cv2.putText(
+                visual_image,
+                window_str,
+                (20, 75),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            # Divider
+            cv2.line(visual_image, (20, 85), (280, 85), (137, 95, 86), 1)
+
+            # Feature values
+            y_offset = 105
+            features_info = [
+                ("Body", reading.get("body")),
+                ("Head", reading.get("head")),
+                ("Hand", reading.get("hand")),
+                ("Leg", reading.get("leg")),
+            ]
+            for name, val in features_info:
+                label = f"{name}: "
+                cv2.putText(
+                    visual_image,
+                    label,
+                    (20, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+                if val is None:
+                    val_str = "NA"
+                    color = (137, 95, 86)  # grey
+                elif val == -1:
+                    val_str = "Left"
+                    color = (142, 118, 247)  # red
+                elif val == 1:
+                    val_str = "Right"
+                    color = (106, 206, 158)  # green
+                else:
+                    val_str = "Center"
+                    color = (247, 162, 122)  # blue/accent
+
+                cv2.putText(
+                    visual_image,
+                    val_str,
+                    (80, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
+                y_offset += 22
+
+            # Show the frame
+            cv2.imshow("Auto Annotator — Pose Tracking", visual_image)
+            cv2.waitKey(1)
+
+        except Exception as e:
+            logger.warning("Failed to render visualization overlay: %s", e, exc_info=True)
+
+    def _save_debug_frame(self, image) -> None:
+        """Save a frame to disk for diagnostic inspection."""
+        try:
+            import cv2
+            debug_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'debug',
+            )
+            os.makedirs(debug_dir, exist_ok=True)
+            path = os.path.join(debug_dir, f"frame_{self._debug_frame_count}.jpg")
+            cv2.imwrite(path, image)
+            logger.info(
+                "DEBUG: Saved frame %d → %s  (shape=%s, mean=%.1f)",
+                self._debug_frame_count, path, image.shape, float(image.mean()),
+            )
+            self._debug_frame_count += 1
+        except Exception as e:
+            logger.warning("Failed to save debug frame: %s", e)
 
     # ── Calibration phase ──────────────────────────────────────────────
 

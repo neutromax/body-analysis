@@ -30,7 +30,7 @@ PLAYER_TIMEOUT: int = 20
 
 # Number of seconds at the start of each video used as the neutral
 # baseline for threshold calibration (K in the spec).
-CALIBRATION_DURATION: int = 3
+CALIBRATION_DURATION: int = 5
 
 # How many standard deviations of natural resting variation a reading
 # must exceed to be classified as intentional movement (k in the spec).
@@ -48,7 +48,7 @@ FALLBACK_T_LEG: float = 0.02    # body-frame lateral velocity (normalized)
 # ═══════════════════════════════════════════════════════════════════════
 
 # Minimum MediaPipe visibility score (0.0–1.0).
-VISIBILITY_THRESHOLD: float = 0.5
+VISIBILITY_THRESHOLD: float = 0.3
 
 # MediaPipe Pose landmark indices (from the 33-landmark model).
 LANDMARK = {

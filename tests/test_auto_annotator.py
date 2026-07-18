@@ -118,6 +118,23 @@ class TestFeatureClassifier:
         # Both active, right dominant moving left
         assert feature_classifier.classify_limb_movement(0.01, -0.05, 0.03) == -1
 
+    def test_classify_limb_position(self):
+        # Both None
+        assert feature_classifier.classify_limb_position(None, None, 0.15) is None
+
+        # Left only, displaced right
+        assert feature_classifier.classify_limb_position(0.20, None, 0.15) == 1
+        # Left only, neutral
+        assert feature_classifier.classify_limb_position(0.10, None, 0.15) == 0
+
+        # Right only, displaced left
+        assert feature_classifier.classify_limb_position(None, -0.20, 0.15) == -1
+
+        # Both active, left dominant displaced right
+        assert feature_classifier.classify_limb_position(0.25, -0.10, 0.15) == 1
+        # Both active, right dominant displaced left
+        assert feature_classifier.classify_limb_position(0.05, -0.30, 0.15) == -1
+
 
 class TestCalibration:
     """Tests for threshold calibration in calibration.py."""
@@ -193,3 +210,30 @@ class TestAggregator:
         assert result["leg"] == 0
         assert result["head"] == 0   # Tie (-1 vs 0): most_recent non-NA is 0 (2nd reading)
         assert result["body"] == 1
+
+    def test_compute_frame_metrics_fallback(self):
+        # Shoulders visible, hips missing
+        # Left shoulder at (0.7, 0.2), Right shoulder at (0.3, 0.2), Nose at (0.5, 0.1)
+        # Wrist at (0.6, 0.4)
+        landmarks = {
+            "LEFT_SHOULDER": (0.7, 0.2, 0.9),
+            "RIGHT_SHOULDER": (0.3, 0.2, 0.9),
+            "NOSE": (0.5, 0.1, 0.9),
+            "LEFT_WRIST": (0.6, 0.4, 0.9),
+            "RIGHT_WRIST": (0.4, 0.4, 0.9),
+        }
+        
+        # Hips are not in the landmarks dictionary at all, or have visibility < 0.3
+        metrics = feature_classifier.compute_frame_metrics(landmarks, None)
+        
+        # Check that we computed body lean, head local x, and wrist positions
+        assert metrics.body_angle_deg is not None
+        assert math.isclose(metrics.body_angle_deg, 0.0, abs_tol=1e-5) # Upright shoulders
+        assert metrics.head_local_x is not None
+        assert math.isclose(metrics.head_local_x, 0.0, abs_tol=1e-5) # Nose centered
+        assert metrics.wrist_left_local_x is not None
+        assert metrics.wrist_right_local_x is not None
+        
+        # Legs should remain None because legs always require actual hips and ankles
+        assert metrics.ankle_left_local_x is None
+        assert metrics.leg_v_left is None

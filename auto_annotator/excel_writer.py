@@ -36,8 +36,8 @@ class ExcelWriter:
     Usage:
         writer = ExcelWriter("output.xlsx")
         writer.start_video("https://youtube.com/watch?v=...")
-        writer.append_row("0:00 – 0:10", {"hand": 1, "leg": 0, "head": -1, "body": 0})
-        writer.append_row("0:10 – 0:20", {"hand": 0, "leg": 0, "head": 0, "body": 1})
+        writer.append_row("0-10", {"hand": 1, "leg": 0, "head": -1, "body": 0})
+        writer.append_row("10-20", {"hand": 0, "leg": 0, "head": 0, "body": 1})
     """
 
     def __init__(self, filepath: str) -> None:
@@ -56,14 +56,27 @@ class ExcelWriter:
         self._rows_written: int = 0
 
         if self.filepath.exists():
-            self._wb = openpyxl.load_workbook(str(self.filepath))
-            # Use the first sheet, or create one if empty.
-            if self._wb.sheetnames:
+            try:
+                self._wb = openpyxl.load_workbook(str(self.filepath))
+                # Use the first sheet, or create one if empty.
+                if self._wb.sheetnames:
+                    self._ws = self._wb.active
+                else:
+                    self._ws = self._wb.create_sheet("Data")
+                    self._write_header()
+                logger.info("Opened existing workbook: %s", self.filepath)
+            except Exception as e:
+                logger.warning(
+                    "Existing Excel file %s is corrupted or invalid (%s). Creating a fresh workbook instead.",
+                    self.filepath,
+                    e
+                )
+                self._wb = openpyxl.Workbook()
                 self._ws = self._wb.active
-            else:
-                self._ws = self._wb.create_sheet("Data")
+                self._ws.title = "Data"
                 self._write_header()
-            logger.info("Opened existing workbook: %s", self.filepath)
+                self._save()
+                logger.info("Created fresh workbook due to corruption: %s", self.filepath)
         else:
             self._wb = openpyxl.Workbook()
             self._ws = self._wb.active
@@ -125,7 +138,7 @@ class ExcelWriter:
         Append one aggregated row to the Excel file.
 
         Args:
-            time_window:  Human-readable time range (e.g. "0:00 – 0:10").
+            time_window:  Time range seconds (e.g. "0-10").
             result:       Dict with keys "hand", "leg", "head", "body",
                           each mapped to -1, 0, 1, or None.
 

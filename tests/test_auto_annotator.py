@@ -14,6 +14,8 @@ import geometry
 import feature_classifier
 import calibration
 import aggregator
+from excel_writer import ExcelWriter
+from tempfile import TemporaryDirectory
 
 
 class TestGeometry:
@@ -237,3 +239,22 @@ class TestAggregator:
         # Legs should remain None because legs always require actual hips and ankles
         assert metrics.ankle_left_local_x is None
         assert metrics.leg_v_left is None
+
+
+class TestExcelWriter:
+    def test_corrupted_excel_fallback(self):
+        with TemporaryDirectory() as tmpdir:
+            corrupted_file = os.path.join(tmpdir, "corrupted.xlsx")
+            # Create a file that is not a valid zip archive (just write plain text to it)
+            with open(corrupted_file, "w") as f:
+                f.write("corrupted excel content")
+            
+            # Initializing ExcelWriter on it should fall back to creating a fresh one
+            writer = ExcelWriter(corrupted_file)
+            assert writer._wb is not None
+            
+            # Verify the headers are present in the fresh workbook
+            ws = writer._ws
+            assert ws.cell(row=1, column=1).value == "Video Link"
+            assert ws.cell(row=1, column=2).value == "Time Window"
+

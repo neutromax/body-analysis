@@ -30,14 +30,16 @@ class StreamReader:
     Runs a background thread to decode and cache the current video frame.
     """
 
-    def __init__(self, youtube_url: str, get_player_time_fn: Optional[callable] = None) -> None:
+    def __init__(self, youtube_url: str, get_player_time_fn: Optional[callable] = None, seek_time: float = 0.0) -> None:
         """
         Args:
             youtube_url:        The YouTube video URL.
             get_player_time_fn: A function that returns the player's current playback time in seconds.
+            seek_time:          The time in seconds to seek to on startup (for resuming progress).
         """
         self.youtube_url = youtube_url
         self.get_player_time = get_player_time_fn
+        self.seek_time = seek_time
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -52,6 +54,15 @@ class StreamReader:
 
         self._is_finished = threading.Event()
         self._decode_start_time: float = 0.0
+        self._genuine_end = False
+
+    @property
+    def is_genuine_end(self) -> bool:
+        """Whether the stream reader genuinely reached the end of the video."""
+        with self._frame_lock:
+            pts = self._current_pts
+            duration = getattr(self, "_duration", 0.0)
+        return self._genuine_end or (duration > 0.0 and pts >= duration - 5.0)
 
     @property
     def current_frame(self) -> Optional[np.ndarray]:
@@ -69,6 +80,12 @@ class StreamReader:
     def is_finished(self) -> bool:
         """Whether the stream has finished decoding all frames."""
         return self._is_finished.is_set()
+
+    @property
+    def duration(self) -> float:
+        """Get the duration of the video in seconds."""
+        with self._frame_lock:
+            return getattr(self, "_duration", 0.0)
 
     def start(self) -> None:
         """Start the background decoding thread."""
@@ -133,7 +150,7 @@ class StreamReader:
         container = None
         video_stream = None
 
-        def _open_container(seek_time: float = 0.0) -> bool:
+        def _open_container() -> bool:
             nonlocal container, video_stream
             if container is not None:
                 try:
@@ -141,7 +158,7 @@ class StreamReader:
                 except Exception:
                     pass
             try:
-                logger.info("Opening PyAV container (seek=%.2fs)...", seek_time)
+                logger.info("Opening PyAV container...")
                 options = {
                     "timeout": "15000000",
                     "reconnect": "1",
@@ -154,21 +171,20 @@ class StreamReader:
                 container = av.open(stream_url, options=options)
                 video_stream = container.streams.video[0]
                 video_stream.thread_type = "AUTO"
-                if seek_time > 0.0:
-                    pts = int(seek_time / video_stream.time_base)
-                    container.seek(pts, stream=video_stream)
+                with self._frame_lock:
+                    self._duration = float(container.duration / 1000000) if container.duration else 0.0
                 return True
             except Exception as e:
                 logger.error("Failed to open stream container: %s", e)
                 return False
 
-        if not _open_container(0.0):
+        if not _open_container():
             self._is_finished.set()
             return
 
-        logger.info("In-memory PyAV decoding loop started.")
+        logger.info("In-memory PyAV decoding loop started. seek_time = %.2fs", self.seek_time)
+        self._decode_start_time = None
         last_cache_time = 0.0
-        self._decode_start_time = time.time()
 
         while not self._stop_event.is_set():
             try:
@@ -177,6 +193,16 @@ class StreamReader:
                         break
 
                     pts_sec = float(frame.pts * video_stream.time_base)
+
+                    # Skip frames before seek_time (fast-forwarding)
+                    if pts_sec < self.seek_time:
+                        continue
+
+                    # Initialize pacing clock upon exiting the fast-forward phase
+                    if self._decode_start_time is None:
+                        self._decode_start_time = time.time() - pts_sec
+                        last_cache_time = pts_sec - 1.0
+                        logger.info("Fast-forward complete. Resuming normal processing at PTS %.2fs", pts_sec)
 
                     # Cache at most 1 frame per second (skip intermediate frames)
                     if pts_sec - last_cache_time < 0.9:
@@ -196,8 +222,9 @@ class StreamReader:
                         while time.time() < target and not self._stop_event.is_set():
                             time.sleep(min(target - time.time(), 0.1))
 
-                # If we exit the for loop normally, the stream ended
-                logger.info("Stream decoding reached end of video.")
+                else:
+                    self._genuine_end = True
+                    logger.info("Stream decoding reached end of video.")
                 break
 
             except Exception as e:
@@ -205,7 +232,9 @@ class StreamReader:
                 time.sleep(2.0)
                 with self._frame_lock:
                     reopen_time = max(0.0, self._current_pts)
-                if not _open_container(reopen_time):
+                self.seek_time = reopen_time
+                self._decode_start_time = None
+                if not _open_container():
                     break
 
         # Signal that decoding is complete.

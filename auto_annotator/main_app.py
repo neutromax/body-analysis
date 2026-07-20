@@ -46,6 +46,7 @@ from auto_config import (
     OBSERVATIONS_PER_WINDOW,
 )
 from session_controller import SessionController, SessionState
+from video_queue import VideoQueueManager, extract_video_id
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,11 @@ class AutoAnnotatorApp:
 
         # State
         self._excel_path: Optional[str] = None
+        self._queue_path: Optional[str] = None
+        self._queue_mgr: Optional[VideoQueueManager] = None
+        self._active_video_info: Optional[dict] = None
+        self._resume_sec: int = 0
+        self._initial_thresholds = None
         self._controller: Optional[SessionController] = None
         self._youtube_url: str = ""
 
@@ -151,22 +157,36 @@ class AutoAnnotatorApp:
         self._build_progress_section(main_frame)
 
     def _build_input_section(self, parent: ttk.Frame) -> None:
-        """Excel file chooser + YouTube URL input + Load Video button."""
+        """Excel files chooser + YouTube URL input + Load Video button."""
         section = ttk.Frame(parent, style="Dark.TFrame")
         section.pack(fill=tk.X, pady=(0, 10))
 
-        # Row 1: Excel file
+        # Row 1: Output Excel file
         row1 = ttk.Frame(section, style="Dark.TFrame")
         row1.pack(fill=tk.X, pady=(0, 6))
 
-        ttk.Label(row1, text="Excel File:", style="Dark.TLabel").pack(side=tk.LEFT)
+        ttk.Label(row1, text="Output Excel:", style="Dark.TLabel").pack(side=tk.LEFT)
         self._excel_label = ttk.Label(
             row1, text="No file selected", style="Dark.TLabel",
         )
         self._excel_label.pack(side=tk.LEFT, padx=(8, 0), expand=True, fill=tk.X)
         ttk.Button(
-            row1, text="Choose .xlsx", style="Dark.TButton",
+            row1, text="Choose Output .xlsx", style="Dark.TButton",
             command=self._choose_excel,
+        ).pack(side=tk.RIGHT)
+
+        # Row 1b: Link Queue File
+        row1b = ttk.Frame(section, style="Dark.TFrame")
+        row1b.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Label(row1b, text="Link Queue:", style="Dark.TLabel").pack(side=tk.LEFT)
+        self._queue_label = ttk.Label(
+            row1b, text="No file selected", style="Dark.TLabel",
+        )
+        self._queue_label.pack(side=tk.LEFT, padx=(8, 0), expand=True, fill=tk.X)
+        ttk.Button(
+            row1b, text="Choose Queue .xlsx", style="Dark.TButton",
+            command=self._choose_queue,
         ).pack(side=tk.RIGHT)
 
         # Row 2: YouTube URL
@@ -185,8 +205,17 @@ class AutoAnnotatorApp:
         )
         self._load_btn.pack(side=tk.RIGHT)
 
+        # Row 3: Resume Info / Queue status
+        row3 = ttk.Frame(section, style="Dark.TFrame")
+        row3.pack(fill=tk.X, pady=(0, 6))
+        self._resume_status_var = tk.StringVar(value="Queue: No queue loaded")
+        ttk.Label(
+            row3, textvariable=self._resume_status_var, style="Dark.TLabel",
+            foreground=COLORS["warning"],
+        ).pack(side=tk.LEFT)
+
     def _build_controls_section(self, parent: ttk.Frame) -> None:
-        """Start / Pause / Stop buttons."""
+        """Start / Pause / Stop / Mark Done buttons."""
         section = ttk.Frame(parent, style="Dark.TFrame")
         section.pack(fill=tk.X, pady=(0, 14))
 
@@ -206,7 +235,13 @@ class AutoAnnotatorApp:
             section, text="⏹  Stop", style="Dark.TButton",
             command=self._stop, state=tk.DISABLED,
         )
-        self._stop_btn.pack(side=tk.LEFT)
+        self._stop_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self._skip_btn = ttk.Button(
+            section, text="⏭  Skip/Done", style="Dark.TButton",
+            command=self._skip_done, state=tk.DISABLED,
+        )
+        self._skip_btn.pack(side=tk.LEFT)
 
     def _build_status_section(self, parent: ttk.Frame) -> None:
         """Live status display — current window, features, calibration."""
@@ -312,14 +347,107 @@ class AutoAnnotatorApp:
     def _choose_excel(self) -> None:
         """Open file dialog to select an existing .xlsx file."""
         path = filedialog.askopenfilename(
-            title="Select Excel File",
+            title="Select Output Excel File",
             filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
         )
         if path:
             self._excel_path = path
             basename = os.path.basename(path)
             self._excel_label.configure(text=basename)
-            logger.info("Excel file selected: %s", path)
+            logger.info("Output Excel file selected: %s", path)
+            if self._youtube_url or self._active_video_info:
+                self._start_btn.configure(state=tk.NORMAL)
+
+    def _choose_queue(self) -> None:
+        """Open file dialog to select the Link Queue Excel file."""
+        path = filedialog.askopenfilename(
+            title="Select Link Queue Excel File",
+            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+        )
+        if path:
+            try:
+                self._queue_path = path
+                self._queue_mgr = VideoQueueManager(path)
+                basename = os.path.basename(path)
+                self._queue_label.configure(text=basename)
+                logger.info("Link Queue Excel file selected: %s", path)
+                self._update_next_video_from_queue()
+            except Exception as e:
+                messagebox.showerror("Error Opening Queue", str(e))
+                self._queue_path = None
+                self._queue_mgr = None
+                self._queue_label.configure(text="No file selected")
+                self._resume_status_var.set("Queue: Error loading queue file")
+
+    def _update_next_video_from_queue(self) -> None:
+        """Fetch the next video from queue, run duplicate checks and cross-check checkpoints."""
+        if not self._queue_mgr:
+            return
+
+        try:
+            next_vid, warnings = self._queue_mgr.get_next_video()
+            if warnings:
+                messagebox.showwarning("Queue Warning", "\n".join(warnings))
+
+            if next_vid:
+                self._active_video_info = next_vid
+                video_id = next_vid["video_id"]
+                video_link = next_vid["video_link"]
+                last_sec = next_vid["last_sec_completed"]
+                
+                # Cross-check checkpoint
+                is_ok, msg, checkpoint_data = self._queue_mgr.cross_check_checkpoint(video_id, last_sec)
+                if not is_ok and msg:
+                    messagebox.showwarning("Checkpoint Disagreement", msg)
+                
+                # Load thresholds from checkpoint if available
+                self._initial_thresholds = None
+                if checkpoint_data:
+                    t_data = checkpoint_data.get("session_info", {}).get("thresholds")
+                    if t_data:
+                        from feature_classifier import Thresholds
+                        self._initial_thresholds = Thresholds(
+                            T_body=t_data.get("T_body"),
+                            T_head=t_data.get("T_head"),
+                            T_hand=t_data.get("T_hand"),
+                            T_leg=t_data.get("T_leg"),
+                            calibrated=True
+                        )
+                
+                # Populate URL entry
+                self._url_var.set(video_link)
+                self._youtube_url = video_link
+                
+                # Update resume label
+                if last_sec is not None and last_sec >= 0:
+                    self._resume_sec = last_sec + 1
+                    self._resume_status_var.set(
+                        f"Queue: video {video_id} resumes at sec {self._resume_sec}."
+                    )
+                else:
+                    self._resume_sec = 0
+                    self._resume_status_var.set(
+                        f"Queue: video {video_id} starts at sec 0."
+                    )
+
+                # Update buttons
+                self._load_btn.configure(state=tk.DISABLED)
+                if self._excel_path:
+                    self._start_btn.configure(state=tk.NORMAL)
+                    self._session_status_var.set("Ready — press Start")
+            else:
+                self._active_video_info = None
+                self._resume_sec = 0
+                self._initial_thresholds = None
+                self._url_var.set("")
+                self._youtube_url = ""
+                self._resume_status_var.set("Queue complete — nothing left to process")
+                self._load_btn.configure(state=tk.NORMAL)
+                self._start_btn.configure(state=tk.DISABLED)
+                self._session_status_var.set("Queue Complete")
+        except Exception as e:
+            logger.error("Failed to update next video from queue: %s", e)
+            messagebox.showerror("Queue Error", f"Error updating next video from queue: {e}")
 
     def _load_video(self) -> None:
         """Validate the YouTube URL and enable the Start button."""
@@ -335,6 +463,19 @@ class AutoAnnotatorApp:
         # Basic URL validation.
         if "youtube.com" not in url and "youtu.be" not in url:
             messagebox.showwarning("Invalid URL", "Please enter a valid YouTube URL.")
+            return
+
+        # Check duplicate-prevention rule if queue is loaded
+        try:
+            vid_id = extract_video_id(url)
+            if self._queue_mgr and self._queue_mgr.is_video_done(vid_id):
+                messagebox.showerror(
+                    "Duplicate Prevention",
+                    f"Video {vid_id} is already marked Done in the queue and cannot be reprocessed."
+                )
+                return
+        except Exception as e:
+            messagebox.showwarning("Invalid URL", f"Could not extract Video ID from URL: {e}")
             return
 
         self._youtube_url = url
@@ -354,6 +495,9 @@ class AutoAnnotatorApp:
             video_url=self._youtube_url,
             root_after=self.root.after,
             gui_callback=self._update_gui,
+            resume_sec=self._resume_sec,
+            initial_thresholds=self._initial_thresholds,
+            queue_mgr=self._queue_mgr,
         )
         self._session_status_var.set("Resolving stream URL...")
         self._controller.start()
@@ -362,6 +506,7 @@ class AutoAnnotatorApp:
         self._start_btn.configure(state=tk.DISABLED)
         self._pause_btn.configure(state=tk.NORMAL)
         self._stop_btn.configure(state=tk.NORMAL)
+        self._skip_btn.configure(state=tk.NORMAL)
         self._load_btn.configure(state=tk.DISABLED)
 
     def _pause(self) -> None:
@@ -380,12 +525,31 @@ class AutoAnnotatorApp:
         """Stop the annotation session."""
         if self._controller:
             self._controller.stop()
+            self._controller = None
 
         self._start_btn.configure(state=tk.NORMAL)
         self._pause_btn.configure(state=tk.DISABLED, text="⏸  Pause")
         self._stop_btn.configure(state=tk.DISABLED)
+        self._skip_btn.configure(state=tk.DISABLED)
         self._load_btn.configure(state=tk.NORMAL)
         self._session_status_var.set("Stopped")
+
+    def _skip_done(self) -> None:
+        """Explicitly mark the current video as Finished/Done and move to next."""
+        if not self._controller:
+            return
+        
+        # Stop session (writes any partial window data)
+        self._controller.stop()
+        
+        # Mark as done in the queue manager
+        if self._queue_mgr and self._active_video_info:
+            try:
+                self._queue_mgr.mark_done(self._active_video_info["video_id"])
+            except Exception as e:
+                logger.error("Failed to mark done in queue sheet: %s", e)
+            
+        self._handle_video_ended()
 
     def _on_video_ended(self) -> None:
         """Called when the YouTube video finishes playing."""
@@ -396,10 +560,28 @@ class AutoAnnotatorApp:
     def _handle_video_ended(self) -> None:
         """Handle video end on the main thread."""
         self._session_status_var.set("✅ Video Finished")
+        
+        if self._controller:
+            try:
+                self._controller.stop()
+            except Exception:
+                pass
+            self._controller = None
+
         self._start_btn.configure(state=tk.NORMAL)
         self._pause_btn.configure(state=tk.DISABLED, text="⏸  Pause")
         self._stop_btn.configure(state=tk.DISABLED)
+        self._skip_btn.configure(state=tk.DISABLED)
         self._load_btn.configure(state=tk.NORMAL)
+
+        # Auto-advance to next video if in queue mode
+        if self._queue_mgr:
+            self._update_next_video_from_queue()
+            if self._active_video_info:
+                logger.info("Auto-advancing to next video in 1 second...")
+                self.root.after(1000, self._start)
+            else:
+                messagebox.showinfo("Queue Complete", "Queue complete — nothing left to process.")
 
     # ── GUI updates ────────────────────────────────────────────────────
 

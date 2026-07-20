@@ -127,7 +127,7 @@ def run_verification():
     # Write to Excel
     writer = ExcelWriter(str(excel_path))
     writer.start_video(youtube_url)
-    writer.append_row("0:00 – 0:10", result)
+    writer.append_row("0-10", result)
 
     # 6. Cleanup and verify
     print("[6/6] Verifying Excel output...")

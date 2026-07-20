@@ -25,6 +25,8 @@ import logging
 import os
 import time
 import math
+import json
+from pathlib import Path
 from enum import Enum, auto
 from typing import Callable, Dict, List, Optional
 
@@ -49,6 +51,7 @@ from calibration import Calibrator
 from aggregator import aggregate_window
 from excel_writer import ExcelWriter
 from stream_reader import StreamReader
+from video_queue import extract_video_id
 
 logger = logging.getLogger(__name__)
 
@@ -65,18 +68,13 @@ class SessionState(Enum):
 
 def _format_time_window(window_index: int, window_duration: int) -> str:
     """
-    Format a time window index as a human-readable range.
+    Format a time window index as a raw seconds range.
 
-    Example: window_index=2, duration=10 → "0:20 – 0:30"
+    Example: window_index=2, duration=10 → "20-30"
     """
     start = window_index * window_duration
     end = start + window_duration
-
-    def _fmt(seconds: int) -> str:
-        m, s = divmod(seconds, 60)
-        return f"{m}:{s:02d}"
-
-    return f"{_fmt(start)} – {_fmt(end)}"
+    return f"{start}-{end}"
 
 
 class SessionController:
@@ -104,6 +102,9 @@ class SessionController:
         video_url: str,
         root_after: Callable,
         gui_callback: Optional[Callable] = None,
+        resume_sec: int = 0,
+        initial_thresholds: Optional[Thresholds] = None,
+        queue_mgr: Optional[Any] = None,
     ) -> None:
         """
         Args:
@@ -111,10 +112,19 @@ class SessionController:
             video_url:    The YouTube URL being annotated.
             root_after:   Tkinter's root.after(ms, callback) for scheduling.
             gui_callback: Called with a status dict every second for GUI updates.
+            resume_sec:   Second to resume from (0 if start from beginning).
+            initial_thresholds: Loaded thresholds if resuming, otherwise None.
+            queue_mgr:    The VideoQueueManager instance (if running in queue mode).
         """
         self._root_after = root_after
         self._gui_callback = gui_callback
         self._video_url = video_url
+        self._resume_sec = resume_sec
+        self._queue_mgr = queue_mgr
+
+        # Extract video ID & path for checkpoints
+        self._video_id = extract_video_id(video_url)
+        self._checkpoint_path = Path(__file__).parent.parent / "data" / "sessions" / f"{self._video_id}.json"
 
         # Modules
         self._engine = PoseEngine()
@@ -123,14 +133,15 @@ class SessionController:
         self._calibrator = Calibrator()
 
         # In-memory stream reader (PyAV + yt-dlp)
-        self._stream_reader = StreamReader(youtube_url=video_url)
+        self._stream_reader = StreamReader(youtube_url=video_url, seek_time=float(resume_sec))
         self._session_start_time: float = 0.0
 
         # State
         self.state = SessionState.IDLE
-        self._thresholds: Optional[Thresholds] = None
+        self._thresholds: Optional[Thresholds] = initial_thresholds
         self._window_readings: List[FrameReading] = []
-        self._window_index: int = 0
+        self._window_index: int = resume_sec // 10
+        self._calibration_metrics: List[FrameMetrics] = []
         self._prev_metrics: Optional[FrameMetrics] = None
         self._after_id: Optional[str] = None
         self._total_rows: int = 0
@@ -146,13 +157,19 @@ class SessionController:
             logger.warning("Cannot start: state is %s", self.state)
             return
 
-        logger.info("Session starting — calibration phase (%ds)", CALIBRATION_DURATION)
-        self.state = SessionState.CALIBRATING
         self._prev_metrics = None
         self._window_readings = []
-        self._window_index = 0
-        self._calibrator = Calibrator()
-        self._session_start_time = time.time()
+        
+        if self._resume_sec > 0:
+            logger.info("Session starting — resuming from second %d (window %d)", self._resume_sec, self._window_index)
+            self.state = SessionState.RUNNING
+            self._session_start_time = time.time() - self._resume_sec
+        else:
+            logger.info("Session starting — calibration phase (%ds)", CALIBRATION_DURATION)
+            self.state = SessionState.CALIBRATING
+            self._window_index = 0
+            self._calibrator = Calibrator()
+            self._session_start_time = time.time()
 
         # Start in-memory stream decoding
         self._stream_reader.start()
@@ -224,6 +241,20 @@ class SessionController:
         if self._stream_reader.is_finished:
             logger.info("Video stream finished decoding.")
             self._flush_partial_window()
+            if self._queue_mgr:
+                if self._stream_reader.is_genuine_end:
+                    self._queue_mgr.mark_done(self._video_id)
+                else:
+                    # Unexpected stream termination
+                    resolve_err = getattr(self._stream_reader, "_resolve_error", None)
+                    if self.state in (SessionState.CALIBRATING, SessionState.RUNNING):
+                        if resolve_err or self._total_rows == 0:
+                            reason = resolve_err or "Stream disconnected prematurely."
+                            self._queue_mgr.mark_error(self._video_id, reason)
+                        else:
+                            last_sec = self._window_index * 10 + len(self._window_readings) - 1
+                            if last_sec >= 0:
+                                self._queue_mgr.mark_progress(self._video_id, last_sec)
             self.state = SessionState.FINISHED
             self._notify_gui(finished=True)
             self._engine.close()
@@ -561,11 +592,18 @@ class SessionController:
     def _handle_calibration_tick(self, metrics: FrameMetrics) -> None:
         """Process one calibration second."""
         self._calibrator.add_reading(metrics)
+        self._calibration_metrics.append(metrics)
 
         if self._calibrator.is_complete:
             self._thresholds = self._calibrator.compute_thresholds()
             self.state = SessionState.RUNNING
             logger.info("Calibration complete → entering main loop.")
+
+            # Classify all collected calibration metrics retrospectively
+            for cal_metrics in self._calibration_metrics:
+                reading = classify_frame(cal_metrics, self._thresholds)
+                self._handle_running_tick(reading)
+            self._calibration_metrics.clear()
 
     # ── Main annotation loop ───────────────────────────────────────────
 
@@ -594,9 +632,118 @@ class SessionController:
             result.get("head"), result.get("body"),
         )
 
+        # Write to checkpoint file and Link Queue sheet immediately
+        self._save_checkpoint()
+        if self._queue_mgr:
+            last_sec = self._window_index * 10 + len(self._window_readings) - 1
+            try:
+                self._queue_mgr.mark_progress(self._video_id, last_sec)
+            except Exception as e:
+                logger.error("Failed to write progress to queue sheet: %s", e)
+
         # Reset for next window.
         self._window_readings = []
         self._window_index += 1
+
+    def _save_checkpoint(self) -> None:
+        """Write current window's raw per-second observations to the JSON checkpoint file."""
+        from datetime import datetime
+        checkpoint_data = None
+        if self._checkpoint_path.exists():
+            try:
+                with open(self._checkpoint_path, "r", encoding="utf-8") as f:
+                    checkpoint_data = json.load(f)
+            except Exception as e:
+                logger.error("Failed to load existing checkpoint: %s", e)
+
+        if not checkpoint_data:
+            duration = getattr(self._stream_reader, "duration", 0.0)
+            total_windows = int(math.ceil(duration / 10.0)) if duration > 0 else 0
+            checkpoint_data = {
+                "session_info": {
+                    "video_url": self._video_url,
+                    "video_id": self._video_id,
+                    "category": "Podcast",
+                    "total_duration": duration,
+                    "total_windows": total_windows,
+                    "annotator": "",
+                    "created_at": datetime.now().isoformat(),
+                    "last_modified": datetime.now().isoformat()
+                },
+                "windows": []
+            }
+
+        # Update thresholds
+        if self._thresholds:
+            checkpoint_data["session_info"]["thresholds"] = {
+                "T_body": self._thresholds.T_body,
+                "T_head": self._thresholds.T_head,
+                "T_hand": self._thresholds.T_hand,
+                "T_leg": self._thresholds.T_leg,
+            }
+
+        start_sec = self._window_index * 10
+        end_sec = start_sec + 10
+
+        obs_list = []
+        for offset, reading in enumerate(self._window_readings):
+            obs_list.append({
+                "time_sec": start_sec + offset,
+                "hand": reading.get("hand"),
+                "leg": reading.get("leg"),
+                "head": reading.get("head"),
+                "body": reading.get("body")
+            })
+
+        # Pad partial windows with null observations to maintain schema structure
+        while len(obs_list) < 10:
+            offset = len(obs_list)
+            obs_list.append({
+                "time_sec": start_sec + offset,
+                "hand": None,
+                "leg": None,
+                "head": None,
+                "body": None
+            })
+
+        new_window = {
+            "window_id": self._window_index,
+            "start_sec": start_sec,
+            "end_sec": end_sec,
+            "observations": obs_list
+        }
+
+        windows = checkpoint_data.setdefault("windows", [])
+        found_idx = -1
+        for idx, win in enumerate(windows):
+            if win.get("window_id") == self._window_index:
+                found_idx = idx
+                break
+
+        if found_idx >= 0:
+            windows[found_idx] = new_window
+        else:
+            windows.append(new_window)
+
+        windows.sort(key=lambda w: w.get("window_id", 0))
+        checkpoint_data["session_info"]["last_modified"] = datetime.now().isoformat()
+
+        try:
+            self._checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self._checkpoint_path.with_suffix(".tmp")
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(checkpoint_data, f, indent=2)
+
+            if self._checkpoint_path.exists():
+                backup_path = self._checkpoint_path.with_suffix(".backup.json")
+                if backup_path.exists():
+                    backup_path.unlink()
+                self._checkpoint_path.rename(backup_path)
+
+            temp_path.rename(self._checkpoint_path)
+            logger.info("Saved raw checkpoint to %s", self._checkpoint_path.name)
+        except Exception as e:
+            logger.error("Failed to write checkpoint file: %s", e)
 
     def _flush_partial_window(self) -> None:
         """Write a partial window (< 10 readings) if any data exists."""
